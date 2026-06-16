@@ -97,17 +97,9 @@ export class CjsLoader {
       modulePath = this.resolution.resolveCjs(from, moduleName);
     }
 
-    if (this.resolution.shouldLoadAsEsm(modulePath)) {
-      if (!supportsSyncEvaluate) {
-        const error: NodeJS.ErrnoException = new Error(
-          `Must use import to load ES Module: ${modulePath}\n` +
-            "Jest's require(ESM) requires Node v24.9+ for " +
-            'synchronous vm module APIs; the current Node version does not ' +
-            'expose them.',
-        );
-        error.code = 'ERR_REQUIRE_ESM';
-        throw error;
-      }
+    // On Node 24.9+ we can require() ESM natively. On older Node, fall
+    // through to the CJS path so a configured transform can convert it.
+    if (supportsSyncEvaluate && this.resolution.shouldLoadAsEsm(modulePath)) {
       // Fast path: skip the graph walker on cache hits.
       const reg = this.registries.getActiveEsmRegistry();
       const cached = reg.get(modulePath);
@@ -151,22 +143,52 @@ export class CjsLoader {
       );
     } catch (error) {
       moduleRegistry.delete(modulePath);
-      // ESM-syntax-in-CJS fallback for require(): retry as native ESM, but if
-      // the ESM parser also rejects it, surface the original CJS error.
-      if (supportsSyncEvaluate && error instanceof CjsParseError) {
-        try {
-          return this.requireEsm<T>(modulePath);
-        } catch (esmError) {
-          if (esmError instanceof Error && esmError.name === 'SyntaxError') {
-            throw error.cause;
-          }
-          throw esmError;
-        }
+      if (error instanceof CjsParseError) {
+        return this.handleCjsParseError<T>(modulePath, error);
       }
       throw error;
     }
 
     return localModule.exports;
+  }
+
+  /**
+   * The CJS compiler rejected the file (ESM syntax in a non-ESM context).
+   * On Node 24.9+ retry as native ESM; on older Node either surface an
+   * actionable error (for explicitly ESM-marked files) or re-throw so the
+   * ESM loader's own CjsParseError catch can trigger its fallback path.
+   */
+  private handleCjsParseError<T>(
+    modulePath: string,
+    parseError: CjsParseError,
+  ): T {
+    if (supportsSyncEvaluate) {
+      try {
+        return this.requireEsm<T>(modulePath);
+      } catch (esmError) {
+        // Both CJS and ESM parsers rejected it — surface the original CJS error.
+        if (esmError instanceof Error && esmError.name === 'SyntaxError') {
+          throw parseError.cause;
+        }
+        throw esmError;
+      }
+    }
+    // Explicitly ESM-marked files (.mjs / "type":"module") can't be retried
+    // by the ESM loader — give the user an actionable error.
+    if (this.resolution.shouldLoadAsEsm(modulePath)) {
+      const error: NodeJS.ErrnoException = new Error(
+        `Must use import to load ES Module: ${modulePath}\n\n` +
+          'The file contains ESM syntax (import/export) that could not be ' +
+          'executed as CommonJS. Either:\n' +
+          '  - Configure a transform (e.g. babel-jest) that compiles this ' +
+          'file to CommonJS, or\n' +
+          '  - Use Node v24.9+ where Jest supports require(esm) natively.',
+      );
+      error.code = 'ERR_REQUIRE_ESM';
+      throw error;
+    }
+    // Unmarked file with ESM syntax — re-throw so the ESM loader can retry.
+    throw parseError;
   }
 
   loadModule(
